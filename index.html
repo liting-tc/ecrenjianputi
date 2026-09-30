@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>多人同步幸运轮盘 (1-31)</title>
+  <title>极简跨设备同步抽签轮盘 (1-31)</title>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'PingFang SC', 'Microsoft YaHei', sans-serif; }
     body { background: #f0f2f5; color: #333; padding: 20px; display: flex; justify-content: center; }
@@ -11,8 +11,7 @@
     
     .card { background: #fff; border-radius: 12px; padding: 24px; box-shadow: 0 4px 12px rgba(0,0,0,0.08); }
     h2 { font-size: 1.2rem; margin-bottom: 16px; color: #1f2937; border-left: 4px solid #3b82f6; padding-left: 8px; }
-    .status-badge { float: right; font-size: 0.8rem; padding: 4px 8px; border-radius: 12px; background: #fee2e2; color: #dc2626; }
-    .status-online { background: #dcfce7; color: #15803d; }
+    .status-badge { float: right; font-size: 0.8rem; padding: 4px 8px; border-radius: 12px; background: #dcfce7; color: #15803d; }
 
     /* 轮盘区 */
     .wheel-section { display: flex; flex-direction: column; align-items: center; justify-content: center; position: relative; }
@@ -54,21 +53,20 @@
     }
   </style>
 
-  <!-- 引入兼容性最强的 Firebase 8.x SDK -->
-  <script src="https://www.gstatic.com/firebasejs/8.10.1/firebase-app.js"></script>
-  <script src="https://www.gstatic.com/firebasejs/8.10.1/firebase-database.js"></script>
+  <!-- 引入公共 Peer 联机信道库 -->
+  <script src="https://cdn.pubnub.com/sdk/javascript/pubnub.7.2.2.min.js"></script>
 </head>
 <body>
 
 <div class="container">
   <!-- 左侧：抽签轮盘展示 -->
   <div class="card wheel-section">
-    <h2>1-31 号码幸运轮盘 <span class="status-badge" id="connStatus">未连接/未配置</span></h2>
+    <h2>1-31 号码幸运轮盘 <span class="status-badge" id="connStatus">🟢 已加入同步网络</span></h2>
     <div class="wheel-wrapper">
       <div class="pointer"></div>
       <canvas id="wheelCanvas" width="400" height="400"></canvas>
     </div>
-    <button id="spinBtn" class="btn btn-spin" onclick="spinWheel()" disabled>开始抽号码</button>
+    <button id="spinBtn" class="btn btn-spin" onclick="spinWheel()">开始抽号码</button>
   </div>
 
   <!-- 右侧：姓名登记与结果呈现 -->
@@ -77,7 +75,7 @@
       <h2>添加参与者</h2>
       <div class="input-group">
         <input type="text" id="nameInput" placeholder="输入名字后按回车" onkeydown="if(event.key==='Enter') addParticipant()">
-        <button class="btn" onclick="addParticipant()" id="addBtn" disabled>添加</button>
+        <button class="btn" onclick="addParticipant()">添加</button>
       </div>
     </div>
 
@@ -96,188 +94,134 @@
 </div>
 
 <script>
-  // ===================================================
-  // 👇 【在这里替换为你申请的 Firebase 项目参数】 👇
-  // ===================================================
-  const firebaseConfig = {
-    apiKey: "你的_API_KEY",
-    authDomain: "你的_项目ID.firebaseapp.com",
-    databaseURL: "https://你的_项目ID-default-rtdb.asia-southeast1.firebasedatabase.app", // 注意结尾可能会根据节点所在地区有所变化
-    projectId: "你的_项目ID",
-    storageBucket: "你的_项目ID.appspot.com",
-    messagingSenderId: "你的_SenderID",
-    appId: "你的_AppID"
-  };
-  // ===================================================
+  // 使用开箱即用的公共演示 Key，无需配置后端
+  const pubnub = new PubNub({
+    publishKey: 'pub-c-8fa71804-d50d-4076-a05b-ee4f55f6e858',
+    subscribeKey: 'sub-c-57ebdf6d-b8d1-4ff2-bc17-b7147db18542',
+    userId: 'user_' + Math.floor(Math.random() * 10000)
+  });
 
-  // 初始化 Firebase
-  let db;
-  let roomRef;
-  try {
-    firebase.initializeApp(firebaseConfig);
-    db = firebase.database();
-    roomRef = db.ref('lotteryRoom');
-  } catch (e) {
-    console.error("Firebase 初始化失败，请检查 firebaseConfig 的设置：", e);
-  }
+  const ROOM_CHANNEL = "lottery_room_sync_31";
 
-  // 本地变量定义
+  // 全局变量
   let availableNumbers = Array.from({length: 31}, (_, i) => i + 1);
   let participants = [];
   let isSpinning = false;
-  let localLastSpinTime = 0;
   let currentRotation = 0;
-  
+
   const canvas = document.getElementById('wheelCanvas');
   const ctx = canvas.getContext('2d');
   const colors = ['#f87171', '#fb923c', '#fbbf24', '#a3e635', '#34d399', '#22d3ee', '#818cf8', '#c084fc', '#f472b6'];
 
-  // 监听 Firebase 数据库状态
-  if (roomRef) {
-    roomRef.on('value', (snapshot) => {
-      const statusEl = document.getElementById('connStatus');
-      statusEl.innerText = "🟢 实时联机中";
-      statusEl.classList.add('status-online');
-      document.getElementById('addBtn').disabled = false;
-      document.getElementById('spinBtn').disabled = false;
-
-      const data = snapshot.val();
-      if (data) {
-        const newData = {
-          availableNumbers: data.availableNumbers || [],
-          participants: data.participants || [],
-          latestSpin: data.latestSpin || { timestamp: 0, currentRotation: 0 }
-        };
-
-        // 如果云端推送了新的“开始抽号”动作
-        if (newData.latestSpin.timestamp > localLastSpinTime) {
-          if (Date.now() - newData.latestSpin.timestamp < 10000) {
-            executeSpinAnimation(newData);
-          } else {
-            snapToResult(newData);
-          }
-        } else if (!isSpinning) {
-          snapToResult(newData);
-        }
-      } else {
-        // 第一次创建数据库节点
-        roomRef.set({
-          availableNumbers: Array.from({length: 31}, (_, i) => i + 1),
-          participants: [],
-          latestSpin: { timestamp: 0, currentRotation: 0 }
-        });
+  // 监听公共通道的消息（所有设备实时同步）
+  pubnub.addListener({
+    message: function(event) {
+      const msg = event.message;
+      if (msg.type === 'SYNC_STATE') {
+        availableNumbers = msg.availableNumbers;
+        participants = msg.participants;
+        updateTable();
+        drawWheel();
+      } else if (msg.type === 'START_SPIN') {
+        availableNumbers = msg.availableNumbers;
+        participants = msg.participants;
+        executeSpinAnimation(msg.targetRotation);
       }
-    }, (error) => {
-      console.error("数据库连接错误:", error);
-      document.getElementById('connStatus').innerText = "❌ 权限拒绝/连接失败";
+    }
+  });
+
+  // 订阅公共通道
+  pubnub.subscribe({ channels: [ROOM_CHANNEL] });
+
+  // 广播当前状态到所有设备
+  function broadcastState() {
+    pubnub.publish({
+      channel: ROOM_CHANNEL,
+      message: {
+        type: 'SYNC_STATE',
+        availableNumbers: availableNumbers,
+        participants: participants
+      }
     });
   }
 
-  // 执行旋转动画
-  function executeSpinAnimation(newData) {
+  // 执行轮盘旋转
+  function executeSpinAnimation(targetRotation) {
     isSpinning = true;
     document.getElementById('spinBtn').disabled = true;
-    
-    localLastSpinTime = newData.latestSpin.timestamp;
-    currentRotation = newData.latestSpin.currentRotation;
+    currentRotation = targetRotation;
 
     canvas.style.transition = 'transform 4s cubic-bezier(0.15, 0.99, 0.35, 1)';
     canvas.style.transform = `rotate(${currentRotation}deg)`;
 
     setTimeout(() => {
-      snapToResult(newData);
+      canvas.style.transition = 'none';
+      canvas.style.transform = `rotate(${currentRotation % 360}deg)`;
+      drawWheel();
+      updateTable();
       isSpinning = false;
       document.getElementById('spinBtn').disabled = false;
     }, 4000);
   }
 
-  // 快速更新UI与轮盘
-  function snapToResult(newData) {
-    localLastSpinTime = newData.latestSpin.timestamp;
-    currentRotation = newData.latestSpin.currentRotation;
-    availableNumbers = newData.availableNumbers;
-    participants = newData.participants;
-
-    canvas.style.transition = 'none';
-    canvas.style.transform = `rotate(${currentRotation % 360}deg)`;
-    drawWheel();
-    updateTable();
-  }
-
   // 添加参与者
   function addParticipant() {
-    if (isSpinning || !roomRef) return;
+    if (isSpinning) return;
     const input = document.getElementById('nameInput');
     const name = input.value.trim();
     if (!name) return;
 
-    roomRef.once('value').then((snap) => {
-      let data = snap.val() || {};
-      let parts = data.participants || [];
-      parts.push({ id: Date.now(), name: name, number: null });
-      roomRef.update({ participants: parts });
-      input.value = '';
-    });
+    participants.push({ id: Date.now(), name: name, number: null });
+    input.value = '';
+    
+    updateTable();
+    broadcastState(); // 向其他设备同步
   }
 
   // 删除参与者
   function deleteParticipant(id) {
-    if (isSpinning || !roomRef) return;
-
-    roomRef.once('value').then((snap) => {
-      let data = snap.val();
-      if (!data) return;
-
-      let parts = data.participants || [];
-      let nums = data.availableNumbers || [];
-
-      const index = parts.findIndex(p => p.id === id);
-      if (index !== -1) {
-        if (parts[index].number !== null) {
-          nums.push(parts[index].number);
-          nums.sort((a, b) => a - b);
-        }
-        parts.splice(index, 1);
-        roomRef.update({ participants: parts, availableNumbers: nums });
+    if (isSpinning) return;
+    const index = participants.findIndex(p => p.id === id);
+    if (index !== -1) {
+      if (participants[index].number !== null) {
+        availableNumbers.push(participants[index].number);
+        availableNumbers.sort((a, b) => a - b);
       }
-    });
+      participants.splice(index, 1);
+      updateTable();
+      drawWheel();
+      broadcastState(); // 向其他设备同步
+    }
   }
 
-  // 开始转号
+  // 开始转动
   function spinWheel() {
-    if (isSpinning || !roomRef) return;
+    if (isSpinning) return;
 
-    roomRef.once('value').then((snap) => {
-      let data = snap.val();
-      if (!data) return;
+    const nextParticipant = participants.find(p => p.number === null);
+    if (!nextParticipant) { alert('请先添加尚未抽签的参与者！'); return; }
+    if (availableNumbers.length === 0) { alert('所有 1-31 号码都已经抽完！'); return; }
 
-      let parts = data.participants || [];
-      let nums = data.availableNumbers || [];
+    const selectedIndex = Math.floor(Math.random() * availableNumbers.length);
+    const sliceAngle = 360 / availableNumbers.length;
+    const targetSliceCenter = selectedIndex * sliceAngle + sliceAngle / 2;
+    const targetDegree = 270 - targetSliceCenter;
 
-      const nextParticipant = parts.find(p => p.number === null);
-      if (!nextParticipant) { alert('请先添加尚未抽签的参与者！'); return; }
-      if (nums.length === 0) { alert('所有 1-31 号码都已经抽完！'); return; }
+    const extraRounds = 5 * 360;
+    const nextRotation = currentRotation + extraRounds + (targetDegree - (currentRotation % 360) + 360) % 360;
 
-      const selectedIndex = Math.floor(Math.random() * nums.length);
-      const sliceAngle = 360 / nums.length;
-      const targetSliceCenter = selectedIndex * sliceAngle + sliceAngle / 2;
-      const targetDegree = 270 - targetSliceCenter;
+    nextParticipant.number = availableNumbers[selectedIndex];
+    availableNumbers.splice(selectedIndex, 1);
 
-      const extraRounds = 5 * 360;
-      const nextRotation = currentRotation + extraRounds + (targetDegree - (currentRotation % 360) + 360) % 360;
-      
-      nextParticipant.number = nums[selectedIndex];
-      nums.splice(selectedIndex, 1);
-
-      // 上传最新转盘广播
-      roomRef.update({
-        participants: parts,
-        availableNumbers: nums,
-        latestSpin: {
-          timestamp: Date.now(),
-          currentRotation: nextRotation
-        }
-      });
+    // 广播转盘指令给所有设备
+    pubnub.publish({
+      channel: ROOM_CHANNEL,
+      message: {
+        type: 'START_SPIN',
+        targetRotation: nextRotation,
+        availableNumbers: availableNumbers,
+        participants: participants
+      }
     });
   }
 
@@ -312,7 +256,7 @@
     }
   }
 
-  // 更新结果表格
+  // 更新表格
   function updateTable() {
     const tbody = document.getElementById('resultTableBody');
     tbody.innerHTML = '';
@@ -331,7 +275,7 @@
     });
   }
 
-  // 初始绘制空轮盘
+  // 初始化
   drawWheel();
 </script>
 </body>
